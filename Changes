@@ -1,0 +1,6 @@
+Revision history for Perl extension FileSystem::LL::FAT.
+
+0.01  Sat Mar 28 18:21:26 2009
+	- original version; created by h2xs 1.23 with options
+		-XAfn FileSystem::LL::FAT
+
