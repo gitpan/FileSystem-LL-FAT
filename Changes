@@ -4,3 +4,14 @@ Revision history for Perl extension FileSystem::LL::FAT.
 	- original version; created by h2xs 1.23 with options
 		-XAfn FileSystem::LL::FAT
 
+0.02
+	new functions		(UNDOCUMENTED).
+	 recurse_dir(), list_dir(), compress_FAT(), uncompress_FAT()
+        New key FAT_raw for process_FAT_data().
+	Reimplement write_dir() in terms of recurse_dir().
+	Fix docs of $exists for write_dir().
+	write_dir() would not recurse correct.
+	API change: write_dir() now takes a reference to directory string
+		and an extra optional arg $how.
+	FAT stored as string reference was wrong.
+	Stop cluster has leading 0 in FAT32 (OTHER PLACE???).

@@ -18,7 +18,7 @@ require Exporter;
 	MBR_2_partitions debug_partitions emit_fat32 interpret_directory
 	check_bootsector interpret_bootsector
 	check_FAT_array FAT_2array cluster_chain read_FAT_data
-	write_file write_dir
+	write_file write_dir list_dir compress_FAT uncompress_FAT
 ) ] );
 
 @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
@@ -27,7 +27,7 @@ require Exporter;
 	
 );
 
-$VERSION = '0.01';
+$VERSION = '0.02';
 use strict;
 
 # Preloaded methods go here.
@@ -522,9 +522,9 @@ sub check_FAT_array ($$;$) {
     $fat->[0], $fat->[0], $b->{media_type}
       unless $fat->[0] == (($b->{media_type} | 0xffffff00) & $max_cluster);
 
-  my $eof = $fat->[1];
+  my $eof = $fat->[1];		# Leading 0 in FAT32:
   die sprintf "Wrong signature %d=%#x in cluster(1)", $eof, $eof
-    unless ($eof >> 3) == ($max_cluster >> 3);
+    unless ($eof >> 3) == ($max_cluster >> (3 + 4*(32==$b->{guessed_FAT_flavor})));
   return 1;
 }
 
@@ -535,10 +535,10 @@ sub cluster_chain ($$$$;$$) {
     unless $cluster >= 2 and $cluster <= $last_cluster;
   my ($c, @clusters) = (1, $cluster);
   my $w = $b->{guessed_FAT_flavor};
-  my $stop_3 = (1<<($w-3)) - 1;
+  my $stop_3 = (1<<($w - 3 - 4*($w==32))) - 1; # Leading 0 in FAT32
   my $total = 1;
   my $subr = ($compress and ref $compress eq 'CODE' and $compress);
-  while ($maxc--) {		# Inspect the last cluster for end of chain too
+  while (--$maxc) {
     # warn "processing $cluster, rem=$maxc, stop_3=$stop_3, w=$w";
     my $next;
     if (ref $fat eq 'ARRAY') {
@@ -566,11 +566,19 @@ sub cluster_chain ($$$$;$$) {
   return 0, \@clusters
 }
 
+sub min($$){my($a,$b)=@_;$a>$b? $b:$a}
+my $lim_read = 512;		# Some bugs in FS driver otherwise?
+
 sub seek_and_read ($$$$;$) {
   my ($fh, $seek, $read) = (shift,shift,shift);
   sysseek $fh, $seek, 0 or die "sysseek $seek: $!" if defined $seek;
-  my $c = sysread $fh, $_[0], $read, $_[1] || 0;
-  die "Short read ($c instead of $read)" unless $c == $read;
+  $_[0] = '' unless defined $_[0];
+  die "seek_and_read outside of string" if ($_[1] || 0) > length $_[0];
+  substr($_[0], $_[1] || 0) = '';
+  my($r,$t,$c) = ($read, 0);
+  $r -= $c, $t += $c
+    while $r and $c = sysread $fh, $_[0], min($r, $lim_read), length $_[0];
+  die "Short read ($t instead of $read)" unless $t == $read;
   1;
 }
 
@@ -627,18 +635,19 @@ sub read_FAT_data ($$;$$$) {
       * $b->{sector_size} unless $how->{FAT_separate};
     die "FAT[$how->{do_FAT}] not present: only $b->{num_FAT_tables} FAT table"
       if $b->{num_FAT_tables} <= $how->{do_FAT};
-    seek_and_read $fh, $o, $b->{sector_size} * $b->{sectors_per_FAT}, $FAT;
+    seek_and_read $fh, $o, $b->{sector_size} * $b->{sectors_per_FAT}, my $F;
     if (defined $how->{parse_FAT}
 	and $b->{last_cluster} < ($how->{parse_FAT} || 3e6)) {
       my @f;
       $#f = $b->{last_cluster};
       @f = ();
-      FAT_2array(\@f, \$FAT, $b->{guessed_FAT_flavor});
+      FAT_2array(\@f, \$F, $b->{guessed_FAT_flavor});
       $FAT = \@f;
     } else {
-      $FAT = \$FAT;
+      $FAT = \$F;
     }
     $out->{FAT} = $FAT;
+    $out->{FAT_raw} = \$F if $how->{raw_FAT} or not defined $how->{parse_FAT};
   }
   if (defined $how->{do_rootdir}) {
     die "need bootsector" unless $b;
@@ -691,7 +700,8 @@ sub output_cluster_chain ($$$$$$;$) {
     }
   };
   my $sz = int(($size + $L - 1)/$L);
-  my ($total) = cluster_chain $start, $sz, $FAT, $b, $piper;
+  # Inspect the last cluster for end of chain too
+  my ($total) = cluster_chain $start, $sz+1, $FAT, $b, $piper;
   die "No end of cluster chain" unless $total;
   1;
 }
@@ -725,22 +735,160 @@ sub write_file ($$$$$;$) {
   # unset archive mode?
 }
 
-sub write_dir ($$$$$;$$$);
-sub write_dir ($$$$$;$$$) {
-  my ($fh, $o_root, $f, $b, $FAT, $depth, $offset, $exists) =
+sub recurse_dir ($$$$$$$;$);
+sub recurse_dir ($$$$$$$;$) {
+  my ($callbk, $path, $fh, $how, $f, $b, $FAT, $offset) =
+    (shift, shift, shift, shift, shift, shift, shift||0);
+  my $files = interpret_directory $$f, $b->{guessed_FAT_flavor} == 32;
+  for my $file (@$files) {
+    # next if $file->{is_volume_label};
+    my $res = $callbk->($path, $file);
+    if ($res and $file->{is_subdir}) {
+      push @$path, $file->{name};
+      recurse_dir($callbk, $path, $fh, $how,
+		  read_cluster_chain($fh, $file->{cluster}, $b, $FAT, $offset),
+		  $b, $FAT, $offset);
+      pop @$path;
+    }
+  }
+}
+
+sub write_dir ($$$$$;$$$$) {
+  my ($fh, $o_root, $ff, $b, $FAT, $how, $depth, $offset, $exists) =
     (shift, shift, shift, shift, shift, shift, shift||0, shift);
   $depth = 1e100 unless defined $depth;
-  mkdir $o_root, 0777 or die "mkdir $o_root: $!" unless $exists;
-  my $files = interpret_directory $f, $b->{guessed_FAT_flavor} == 32;
-  for my $file (@$files) {
-    next if $file->{is_volume_label};
-    ($depth > 0 and 
-     write_dir($fh, "$o_root/$file->{name}",
-	       read_cluster_chain($fh, $file->{cluster}, $b, $FAT, $offset),
-	       $b, $FAT, $depth-1, $offset)), next
-      if $file->{is_subdir};
-    write_file $fh, $o_root, $file, $b, $FAT, $offset;
+  my $callbk = sub ($$) {
+    my($path,$f) = (shift, shift);
+    next if $f->{is_volume_label};
+    my $p = join '/', $o_root, @$path;
+    return write_file $fh, $p, $f, $b, $FAT, $offset unless $f->{is_subdir};
+    return 0 if @$path >= $depth;
+    mkdir "$p/$f->{name}", 0777 or die "mkdir `$p/$f->{name}': $!"
+      unless $exists and not @$path;
+    return 1;
+  };
+  recurse_dir($callbk, [], $fh, $how||{}, $ff, $b, $FAT, $offset);
+}
+
+sub list_dir ($$$$;$$$) {
+  my ($fh, $ff, $b, $FAT, $how, $depth, $offset) =
+    (shift, shift, shift, shift, shift, shift, shift||0, shift);
+  $depth = 1e100 unless defined $depth;
+  my $callbk = sub ($$) {
+    my($path,$f) = (shift, shift);
+    print("# ? label=$f->{name}\n"), next if $f->{is_volume_label};
+    my $p = join '/', @$path, $f->{name};
+    $p .= '/' if $f->{is_subdir};
+    print "$f->{attrib}\t$f->{size}\t$f->{date_write}/$f->{time_write}\t$f->{cluster}\t$p\n";
+    return @$path < $depth;
+  };
+  recurse_dir($callbk, [], $fh, $how||{}, $ff, $b, $FAT, $offset);
+}
+
+# First FAT entry contains 0xFF*, the rest 0x0F*; so 0x2*, 0xA* do not conflict
+sub compress_FAT ($$$) {	# Down to 2-4 bytes/file after gzip...
+  my($FAT, $w, $fh) = (shift, shift, shift);
+  my ($c, $cc, $c0, $off, $ee, $remain, @out, $F) = (0, 0, 0, 0);
+  local $\ = '';
+  while (1) {
+    if (ref $FAT eq 'ARRAY') {
+      $F = $FAT, $remain = 0;
+    } else {
+      $remain = length $$FAT unless defined $remain;
+      my $l = $remain;
+      $l = 750000 if $l > 750000; # Should be divisible by 12...
+      FAT_2array($F = [], $FAT, $w, $off, $l);
+      $remain -= $l, $off += $l;
+    }
+    for my $e (@$F) {
+      $c++;			# Next cluster
+      if ($e) {
+	(push @out, 0xA0000000 + $c0), $c0 = 0 if $c0;
+	$cc++, next if $e == $c;
+	(push @out, 0x20000000 + $cc), $cc = 0 if $cc;
+	push @out, $e;
+      } else {
+	(push @out, 0x20000000 + $cc), $cc = 0 if $cc;
+	$c0++, next;
+      }
+      (print $fh pack 'V*', @out), @out = () if @out > 1000;
+    }
+    last unless $remain;
   }
+  push @out, 0xA0000000 + $c0 if $c0;
+  push @out, 0x20000000 + $cc if $cc;
+  print $fh pack 'V*', @out;
+}
+
+sub _FAT_2string ($$$$) {
+  my($FAT, $w, $start, $c) = @_;
+  if ($w eq 12) {
+    my($out, $e) = ('', $start + $c);
+    while ($start < $e) {	# Assume even
+      my $x = pack 'V', $FAT->[$start] + ($FAT->[$start+1]<<12);
+      $out .= substr $x, 0, 3;
+      $start += 2;
+    }
+    $out;
+  } else {	# $w is 'V' or 'v'
+    pack "$w*", @$FAT[$start .. $start + $c - 1];
+  }
+}
+
+sub output_FAT ($$$) {
+  my($FAT, $w, $fh, $s) = (shift, shift, shift, 0);
+  local $\ = '';
+  (print $fh $$FAT), return unless ref $FAT eq 'ARRAY';
+  my $c = @$FAT;
+  $w = (32 == $w) ? 'V' : 'v' if $w != 12;
+  while ($c) {
+    my $cc = ($c > 750000) ? 750000 : $c;
+    print $fh _FAT_2string($FAT, $w, $s, $cc);
+    $c -= $cc, $s += $cc;
+  }
+}
+
+sub __emit ($$$) {
+  my($ofh, $out, $w) = (shift, shift, shift);
+  my $outc = @$out;
+  my $cut;
+  $cut = 1, $outc-- if $w eq 12 and $outc % 2;
+  print $ofh _FAT_2string($out, $w, 0, $outc);
+  @$out = $cut ? $$out[-1] : ();
+}
+
+sub uncompress_FAT ($$$) {
+  my($ifh, $w, $ofh) = (shift, shift, shift);
+  my ($c, @f, @out, $F) = (0);
+  @f[0x2, 0xA] = (0x2, 0xA);
+  local $\ = '';
+  $w = (32 == $w) ? 'V' : 'v' if $w != 12;
+  while (1) {
+    last unless sysread $ifh, $F, 4*1e4;
+    for my $n (unpack 'V*', $F) {
+      my $n1 = $f[$n >> 28];
+      if ($n1) {		# Special
+	my $cc = $n & 0xFFFFFFF;
+	while ($cc) {
+	  my ($ccc, @rest) = $cc;
+	  $ccc = 1e4 if $ccc > 1e4;
+	  if ($n1 == 0x2) {	# A run
+	    push @out, $c + 1 .. $c + $ccc;
+	  } else {		# 0s
+	    push @out, (0) x $ccc;
+	  }
+	  $cc -= $ccc, $c += $ccc;
+	  __emit($ofh, \@out, $w) if @out >= 1e4;
+	}
+      } else {
+	$c++;
+	push @out, $n;
+      }
+    }
+    __emit($ofh, \@out, $w) if @out >= 1e4;
+  }
+  __emit($ofh, \@out, $w);
+  die "Odd number of uncompressed items, w=$w" if @out;
 }
 
 1;
@@ -938,20 +1086,23 @@ end of the allocated space); anyway, C<$hash-E<gt>{rootdir_raw}> is
 string representation of the root directory.
 
 The keys C<keep_del>, C<keep_dots>, C<keep_labels> are given as
-corresponding arguments to interpret_directory().
+corresponding arguments to interpret_directory().  If values
+referenced by C<raw_FAT> is TRUE, or by C<parse_FAT> is undefined,
+C<$hash-E<gt>{FAT_raw}> contains a reference to the string
+representation of FAT.
 
-=head2 write_dir($fh, $o_root, $d, $b, $FAT, [$depth, $offset, $exists])
+=head2 write_dir($fh, $o_root, $d, $b, $FAT, [$how, $depth, $offset, $exists])
 
-recursively extract the content of directory $d (a raw string
-representation of the directory as represented on disk).  $depth zero
-corresponds to no extraction of subdirectories (give C<undef> or an
-insanely large number to have unlimited depth; e.g., 1e100).  $fh
-should be a file handle representing the disk content with bootsector
-at $offset.  $o_root is the output directory: the files in $d will be
-put there.
+recursively extract the content of directory $d (a reference to raw
+string representation of the directory as represented on disk).
+$depth zero corresponds to no extraction of subdirectories (give
+C<undef> or an insanely large number to have unlimited depth; e.g.,
+1e100).  $fh should be a file handle representing the disk content
+with bootsector at $offset.  $o_root is the output directory: the
+files in $d will be put there.
 
-If $exists is TRUE, no warning will be given if $o_root exists.  (The
-parent of $o_root should exist.)
+If $exists is TRUE, $o_root exists.  (The parent of $o_root should
+always exist.)
 
 =head2 write_file($fh, $dir, $file, $b, $FAT [, $offset ] )
 
@@ -1011,6 +1162,8 @@ We ignore LFNs records with C<seq-number E<gt> 0x7F>, unless 0xE5.
 When do they appear?
 
 How to follow logical partitions?
+
+Test suite is practically absent...
 
 =head1 SEE ALSO
 
