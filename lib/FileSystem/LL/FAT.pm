@@ -27,7 +27,7 @@ require Exporter;
 	
 );
 
-$VERSION = '0.02';
+$VERSION = '0.03';
 use strict;
 
 # Preloaded methods go here.
@@ -584,7 +584,7 @@ sub seek_and_read ($$$$;$) {
 
 sub read_FAT_data ($$;$$$) {
   my ($fh, $how, $offset, $b, $FAT) = (shift, shift, shift||0, shift, shift);
-  my ($close, $inif, $out, $mbr);
+  my ($close, $inif, $out, $mbr, $b_read);
   unless (ref $fh) {
     open IN, '<', $inif = $fh or die "open `$fh' for read: $!";
     $fh = \*IN;
@@ -595,9 +595,10 @@ sub read_FAT_data ($$;$$$) {
     seek_and_read $fh, $offset, 512, $mbr;
     if ($how->{do_MBR} eq 'maybe' and defined $how->{do_bootsector}) {
       eval { my $b1 = interpret_bootsector $mbr;
-	     check_bootsector $b;
+	     check_bootsector $b1;
 	     $out->{bootsect_off} = $offset;
-	     $b = $out->{bootsector} = $b1 } and undef $mbr;
+	     $b = $out->{bootsector} = $b1;
+	     $b_read = 1 } and undef $mbr;
     }
     if ($mbr and (defined $how->{parse_MBR} or defined $how->{do_bootsector}
 		  or defined $how->{do_rootdir} or defined $how->{do_FAT})) {
@@ -614,9 +615,8 @@ sub read_FAT_data ($$;$$$) {
       $out->{mbr} = {%$fields, partitions => \@p};
     }
   }
-  if ((defined $how->{do_bootsector} or defined $how->{do_rootdir}
-       or defined $how->{do_FAT})
-      and not $b) {
+  if (defined $how->{do_bootsector} and not $b_read) {
+    die "Bootsector given as argument and needs to be read too?" if $b;
     seek_and_read $fh, $offset, 512, my $bs;
     if (defined $how->{parse_bootsector} or defined $how->{do_rootdir}
 	or defined $how->{do_FAT}) {
@@ -630,6 +630,7 @@ sub read_FAT_data ($$;$$$) {
   }
   if (defined $how->{do_FAT}) {
     die "need bootsector" unless $b;
+    die "FAT given as argument and needs to be read too?" if $FAT;
     my $o = $offset;
     $o += ($b->{FAT_table_off} + $how->{do_FAT} * $b->{sectors_per_FAT})
       * $b->{sector_size} unless $how->{FAT_separate};
@@ -651,20 +652,29 @@ sub read_FAT_data ($$;$$$) {
   }
   if (defined $how->{do_rootdir}) {
     die "need bootsector" unless $b;
-    my($s, $L, $S) = ('', $b->{sector_size} * $b->{sectors_in_cluster},
-		      $offset + $b->{sector_of_cluster0}*$b->{sector_size});
-    my($l, $o);
-    if ($b->{guessed_FAT_flavor} == 32) {
-      die "need FAT" unless $FAT;
-      my $appender = sub ($$) {
-	my($start, $len) = (shift, shift);
-	seek_and_read $fh, $S + $L * $start, $len * $L, $s, length $s;
-      };
-      cluster_chain($b->{rootdir_start_cluster}, 0, $FAT, $b, $appender);
+    my($s, $l, $o) = '';
+    if ($how->{rootdir_is_standalone}) {
+      local $/;
+      $s = <$fh>;
     } else {
-      my $off = ($offset + $b->{sector_size} *
-		 ($b->{FAT_table_off} + $b->{num_FAT_tables} * $b->{sectors_per_FAT}));
-      seek_and_read $fh, $off, $b->{root_dir_entries} * 0x20, $s;
+      my($L, $S) = ($b->{sector_size} * $b->{sectors_in_cluster},
+		      $offset + $b->{sector_of_cluster0}*$b->{sector_size});
+      if ($b->{guessed_FAT_flavor} == 32) {
+	my $appender = sub ($$) {
+	  my($start, $len) = (shift, shift);
+	  seek_and_read $fh, $S + $L * $start, $len * $L, $s, length $s;
+	}
+	;
+	if ($FAT) {
+	  cluster_chain($b->{rootdir_start_cluster}, 0, $FAT, $b, $appender);
+	} else {
+	  $appender->($b->{rootdir_start_cluster}, 1); # XXX Assume 1 cluster
+	}
+      } else {
+	my $off = ($offset + $b->{sector_size} *
+		   ($b->{FAT_table_off} + $b->{num_FAT_tables} * $b->{sectors_per_FAT}));
+	seek_and_read $fh, $off, $b->{root_dir_entries} * 0x20, $s;
+      }
     }
     if (defined $how->{parse_rootdir}) {
       my($res, $f) = interpret_directory $s, $b->{guessed_FAT_flavor} == 32,
@@ -686,34 +696,37 @@ sub output_cluster_chain ($$$$$$;$) {
   my($L, $S) = ($b->{sector_size} * $b->{sectors_in_cluster},
 		$offset + $b->{sector_of_cluster0}*$b->{sector_size});
   my $piper = sub ($$) {
-    my($start, $len) = (shift, $L * shift);
-    # warn "Piper: start=$start, len=$len\n";
+    my($start1, $len) = ($L * shift, $L * shift);
+    # warn "Piper: start=$start1, len=$len\n";
     if ($len > $size) {
       die "Cluster chain too long, len=$len, cl=$L, sz=$size" if $len - $L >= $size;
       $len = $size;
     }
     while ($len) {
       my $l = ($len > (1<<24)) ? (1<<24) : $len; # 16M chunks
-      seek_and_read $ifh, $S + $L * $start, $l, my $s;
+      seek_and_read $ifh, $S + $start1, $l, my $s;
       syswrite $ofh, $s, length $s;
-      $len -= $l, $size -= $l;
+      $len -= $l, $size -= $l, $start1 += $l;
     }
   };
   my $sz = int(($size + $L - 1)/$L);
+  $piper->($start, $sz), return 1 if not defined $FAT;
   # Inspect the last cluster for end of chain too
   my ($total) = cluster_chain $start, $sz+1, $FAT, $b, $piper;
   die "No end of cluster chain" unless $total;
   1;
 }
 
-sub read_cluster_chain ($$$$;$) { # No size, as in dir...
-  my($ifh, $start, $b, $FAT, $offset) = 
-    (shift, shift, shift, shift, shift||0);
+sub read_cluster_chain ($$$$;$$) { # No size, as in dir...
+  my($ifh, $start, $b, $FAT, $offset, $exp_len) =
+    (shift, shift, shift, shift, shift||0, shift);
   my($L, $S, $s) = ($b->{sector_size} * $b->{sectors_in_cluster},
 		    $offset + $b->{sector_of_cluster0}*$b->{sector_size}, '');
+  (seek_and_read $ifh, $S + $L * $start, $exp_len, $s),
+    return \$s if not defined $FAT and defined $exp_len;
   my $piper = sub ($$) {
-    my($start, $l) = (shift, $L * shift);
-    seek_and_read $ifh, $S + $L * $start, $l, $s, length $s;
+    my($start1, $l) = (shift, shift);
+    seek_and_read $ifh, $S + $L * $start1, $L * $l, $s, length $s;
   };
   my ($total) = cluster_chain $start, 0, $FAT, $b, $piper;
   die "No end of cluster chain" unless $total;
@@ -739,14 +752,20 @@ sub recurse_dir ($$$$$$$;$);
 sub recurse_dir ($$$$$$$;$) {
   my ($callbk, $path, $fh, $how, $f, $b, $FAT, $offset) =
     (shift, shift, shift, shift, shift, shift, shift||0);
-  my $files = interpret_directory $$f, $b->{guessed_FAT_flavor} == 32;
+  my $files = interpret_directory( $$f, $b->{guessed_FAT_flavor} == 32,
+				   $how->[0], $how->[1], $how->[2] );
   for my $file (@$files) {
     # next if $file->{is_volume_label};
     my $res = $callbk->($path, $file);
-    if ($res and $file->{is_subdir}) {
+    if ($res and $file->{is_subdir} and not $file->{deleted}
+	and $file->{name} !~ /^\.(\.)?$/) {
       push @$path, $file->{name};
+      my $exp_len;
+      $exp_len = $b->{sector_size} * $b->{sectors_in_cluster}
+	unless defined $FAT;	# XXXX Expect dir size of one cluster???
       recurse_dir($callbk, $path, $fh, $how,
-		  read_cluster_chain($fh, $file->{cluster}, $b, $FAT, $offset),
+		  read_cluster_chain($fh, $file->{cluster}, $b, $FAT, $offset,
+				     $exp_len),
 		  $b, $FAT, $offset);
       pop @$path;
     }
@@ -759,7 +778,7 @@ sub write_dir ($$$$$;$$$$) {
   $depth = 1e100 unless defined $depth;
   my $callbk = sub ($$) {
     my($path,$f) = (shift, shift);
-    next if $f->{is_volume_label};
+    next if $f->{is_volume_label} or $f->{name} =~ /^\.(\.)?$/;
     my $p = join '/', $o_root, @$path;
     return write_file $fh, $p, $f, $b, $FAT, $offset unless $f->{is_subdir};
     return 0 if @$path >= $depth;
@@ -767,7 +786,7 @@ sub write_dir ($$$$$;$$$$) {
       unless $exists and not @$path;
     return 1;
   };
-  recurse_dir($callbk, [], $fh, $how||{}, $ff, $b, $FAT, $offset);
+  recurse_dir($callbk, [], $fh, $how||[], $ff, $b, $FAT, $offset);
 }
 
 sub list_dir ($$$$;$$$) {
@@ -775,14 +794,16 @@ sub list_dir ($$$$;$$$) {
     (shift, shift, shift, shift, shift, shift, shift||0, shift);
   $depth = 1e100 unless defined $depth;
   my $callbk = sub ($$) {
-    my($path,$f) = (shift, shift);
-    print("# ? label=$f->{name}\n"), next if $f->{is_volume_label};
+    my($path,$f,$pre) = (shift, shift, '');
+    print("# label=$f->{name}\n"), return if $f->{is_volume_label};
     my $p = join '/', @$path, $f->{name};
     $p .= '/' if $f->{is_subdir};
-    print "$f->{attrib}\t$f->{size}\t$f->{date_write}/$f->{time_write}\t$f->{cluster}\t$p\n";
+    $pre = '#del ' if $f->{deleted};
+    $pre = '# ' if $f->{name} =~ /^\.(\.)?$/;
+    print "$pre$f->{attrib}\t$f->{size}\t$f->{date_write}/$f->{time_write}\t$f->{cluster}\t$p\n";
     return @$path < $depth;
   };
-  recurse_dir($callbk, [], $fh, $how||{}, $ff, $b, $FAT, $offset);
+  recurse_dir($callbk, [], $fh, $how||[], $ff, $b, $FAT, $offset);
 }
 
 # First FAT entry contains 0xFF*, the rest 0x0F*; so 0x2*, 0xA* do not conflict
@@ -1056,7 +1077,8 @@ the number of valid partitions differs from 1, the call die()s.
 If the value of key C<FAT_separate> is TRUE, $offset is the offset of
 the start of (the first) FAT in the file; otherwise it is the offset
 of MBR or bootsector (offsets of other parts are calculated as
-needed).
+needed).  If the value of kye C<rootdir_is_standalone> is TRUE,
+rootdir is assumed to be the whole content of the file.
 
 If the values of keys C<parse_MBR>, C<parse_bootsector>, C<parse_FAT>,
 C<parse_rootdir> are defined (or this is needed for processing of
@@ -1103,6 +1125,9 @@ files in $d will be put there.
 
 If $exists is TRUE, $o_root exists.  (The parent of $o_root should
 always exist.)
+
+$how is an optional array reference, with first elements being
+the $keep_del, $keep_dots, $keep_labels for interpret_directory() call.
 
 =head2 write_file($fh, $dir, $file, $b, $FAT [, $offset ] )
 
@@ -1164,6 +1189,12 @@ When do they appear?
 How to follow logical partitions?
 
 Test suite is practically absent...
+
+When recursing into a directory without FAT table present, we assume
+that subdirs have size of one cluster.  To do otherwise, need to
+check that subsequent clusters are not directories; how to do it?
+
+And how often are directories continuous on disk?
 
 =head1 SEE ALSO
 

@@ -15,3 +15,14 @@ Revision history for Perl extension FileSystem::LL::FAT.
 		and an extra optional arg $how.
 	FAT stored as string reference was wrong.
 	Stop cluster has leading 0 in FAT32 (OTHER PLACE???).
+
+0.03
+	recurse_dir() allows operation without FAT table (currently assumes
+		that subdirectories take at most 1 cluster).
+	recurse_dir() allows $how to be an array reference; hence the same
+		for write_dir(), list_dir().
+	output_cluster_chain() would repeat 16MB the same chunk...
+	output_cluster_chain() supports operation with $FAT undefined
+		(assumes continuous files); hence the same for write_file(),
+		write_dir().
+	recursing and listing works with deleted files and "." "..".
