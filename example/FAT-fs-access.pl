@@ -45,7 +45,7 @@ eval {
 
 (@ARGV == 0 and !$help) or die <<EOD;
 usage: $0 [-nFAT=N -offset=BYTES -extract-rootdir=ROOTDIR -rootdir
-	   -dump_bs -notry-MBR -read-bs=FILE -read-FAT=FILE -read-rootdir=FILE
+	   -dump-bs -notry-MBR -read-bs=FILE -read-FAT=FILE -read-rootdir=FILE
 	   -extra-offset=N -ignore-FAT -partition=PART_NUM
 	   -output-FAT=FILE -compress-FAT -assume-FAT-flavor=12|16|32
 	   -emit-cl-chain=START,LEN[cl] ]       [ < \\.\f: ]
@@ -74,6 +74,12 @@ extract files and chains of clusters.  E.g., on DOSISH systems
 (useful when a directory is converted to a file by chkdsk, so FAT is
 ruined; if one has a backup of FAT, usually it should be more reliable
 to use the old version of FAT instead of ignoring FAT).
+
+(Non-recursive listing is the only operation where the only
+information used about the disk is the "flavor" of FAT, which is
+12/16/32 for FAT12/FAT16/FAT32.  So this is the only operation which
+may be done with access to ONLY the file image of the starting
+directory, as far as -assume-FAT-flavor option is given.)
 
 EOD
 
@@ -128,7 +134,8 @@ $how_bootsector{do_rootdir} = $how{do_rootdir} unless $r_rootdir;
 
 goto skip_bs unless $need_bootsector;
 
-$r_bs = \*STDIN, binmode STDIN unless defined $r_bs;
+(-t STDIN and die "To get bootsector, I need STDIN open to \"raw disk\" file"),
+  $r_bs = \*STDIN, binmode STDIN unless defined $r_bs;
 my $out = read_FAT_data $r_bs, \%how_bootsector, $offset;
 my $b = $out->{bootsector};
 
@@ -156,7 +163,7 @@ if ($dump_bootsector and $b) {
 
 if (defined $rootdir_outdir or ($list and $depth)) {
   die "Need bootsector" unless $b;
-  die "Need STDIN open to \"raw disk\" file" if -t STDIN;
+  die "For extraction and recursive listing, I need STDIN open to \"raw disk\" file" if -t STDIN;
   binmode STDIN;
 }
 write_dir \*STDIN, $rootdir_outdir, \ $out->{rootdir_raw},
@@ -167,8 +174,8 @@ if ($list) {
   my $bb = $b || {guessed_FAT_flavor => $assume_FAT_flavor};
   $bb->{guessed_FAT_flavor}
     or die "Need -assume-FAT-flavor option in absense of bootsector";
-  list_dir \*STDIN, \ $out->{rootdir_raw}, $bb, $used_FAT, [1, 1, 1],
-    $depth, $offset + $e_offset;
+  list_dir \*STDIN, \ $out->{rootdir_raw}, $bb, $used_FAT,
+    {qw(keep_del 1 keep_dots 1 keep_labels 1)}, $depth, $offset + $e_offset;
 }
 
 if (defined $FAT_out) {
@@ -186,7 +193,10 @@ syswrite_file $bs_out, $b->{raw} if defined $bs_out;
 
 if ($emit_cl_chain) {
   my($start, $l) = split /,/, $emit_cl_chain, 2;
-  $l = $1 * $b->{sector_size} * $b->{sectors_in_cluster} if $l =~ /^(\d+)cl$/;
+  die "To raw read, I need STDIN open to \"raw disk\" file" if -t STDIN;
+  ($b or die "Need bootsector") and
+    $l = $1 * $b->{sector_size} * $b->{sectors_in_cluster}
+      if $l =~ /^(\d+)cl$/;
   binmode STDOUT;
   FileSystem::LL::FAT::output_cluster_chain(\*STDIN, \*STDOUT, $start, $l, $b, $used_FAT, $offset + $e_offset);
 }

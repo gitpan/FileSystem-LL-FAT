@@ -26,3 +26,10 @@ Revision history for Perl extension FileSystem::LL::FAT.
 		(assumes continuous files); hence the same for write_file(),
 		write_dir().
 	recursing and listing works with deleted files and "." "..".
+
+0.04
+	New environment variable FAT_READ_NEEDS_1SECTOR to raw read by 512b.
+	recurse_dir() was mangling $FAT if undefined.
+	Argument $how to recurse_dir() etc changed to a hash reference.
+	Now actually used for system recovery...
+

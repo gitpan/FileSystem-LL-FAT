@@ -27,8 +27,12 @@ require Exporter;
 	
 );
 
-$VERSION = '0.03';
+$VERSION = '0.04';
 use strict;
+
+my $lim_read = $ENV{FAT_READ_NEEDS_1SECTOR};
+$lim_read = ($^O eq 'os2') unless defined $lim_read; #Bug in OS/2 FAT32 driver?
+$lim_read = $lim_read ? 512 : (1<<24);
 
 # Preloaded methods go here.
 sub decode_fields ($$) {
@@ -567,7 +571,6 @@ sub cluster_chain ($$$$;$$) {
 }
 
 sub min($$){my($a,$b)=@_;$a>$b? $b:$a}
-my $lim_read = 512;		# Some bugs in FS driver otherwise?
 
 sub seek_and_read ($$$$;$) {
   my ($fh, $seek, $read) = (shift,shift,shift);
@@ -704,7 +707,8 @@ sub output_cluster_chain ($$$$$$;$) {
     }
     while ($len) {
       my $l = ($len > (1<<24)) ? (1<<24) : $len; # 16M chunks
-      seek_and_read $ifh, $S + $start1, $l, my $s;
+      my $s;
+      seek_and_read $ifh, $S + $start1, $l, $s;
       syswrite $ofh, $s, length $s;
       $len -= $l, $size -= $l, $start1 += $l;
     }
@@ -751,9 +755,10 @@ sub write_file ($$$$$;$) {
 sub recurse_dir ($$$$$$$;$);
 sub recurse_dir ($$$$$$$;$) {
   my ($callbk, $path, $fh, $how, $f, $b, $FAT, $offset) =
-    (shift, shift, shift, shift, shift, shift, shift||0);
-  my $files = interpret_directory( $$f, $b->{guessed_FAT_flavor} == 32,
-				   $how->[0], $how->[1], $how->[2] );
+    (shift, shift, shift, shift, shift, shift, shift, shift||0);
+  my $files =
+    interpret_directory( $$f, $b->{guessed_FAT_flavor} == 32, $how->{keep_del},
+			 $how->{keep_dots}, $how->{keep_labels} );
   for my $file (@$files) {
     # next if $file->{is_volume_label};
     my $res = $callbk->($path, $file);
@@ -786,7 +791,7 @@ sub write_dir ($$$$$;$$$$) {
       unless $exists and not @$path;
     return 1;
   };
-  recurse_dir($callbk, [], $fh, $how||[], $ff, $b, $FAT, $offset);
+  recurse_dir($callbk, [], $fh, $how||{}, $ff, $b, $FAT, $offset);
 }
 
 sub list_dir ($$$$;$$$) {
@@ -803,7 +808,7 @@ sub list_dir ($$$$;$$$) {
     print "$pre$f->{attrib}\t$f->{size}\t$f->{date_write}/$f->{time_write}\t$f->{cluster}\t$p\n";
     return @$path < $depth;
   };
-  recurse_dir($callbk, [], $fh, $how||[], $ff, $b, $FAT, $offset);
+  recurse_dir($callbk, [], $fh, $how||{}, $ff, $b, $FAT, $offset);
 }
 
 # First FAT entry contains 0xFF*, the rest 0x0F*; so 0x2*, 0xA* do not conflict
@@ -1126,8 +1131,9 @@ files in $d will be put there.
 If $exists is TRUE, $o_root exists.  (The parent of $o_root should
 always exist.)
 
-$how is an optional array reference, with first elements being
-the $keep_del, $keep_dots, $keep_labels for interpret_directory() call.
+$how is an optional hash reference, with values for keys C<keep_del>,
+C<keep_dots>, C<keep_labels> giving arguments for
+interpret_directory() call.
 
 =head2 write_file($fh, $dir, $file, $b, $FAT [, $offset ] )
 
@@ -1175,9 +1181,30 @@ do it as
   dd if=//./d: bs=512 count=1 of=disk.bootsector
 
 On UNIXish systems one needs to find the corresponding device file (by
-calling B<mount>?), and do
+calling B<mount> or B</sbin/mount>?), and do
 
   dd if=/dev/hda3 bs=512 count=1 of=disk.bootsector
+
+Other DOSish conventions (see also F<diskext>, F<bootpart>, F<mkbt> programs):
+
+  \\?\Device\Harddisk0\Partition0 	# Partition0 is entire disk
+  //./physicaldrive0
+  /dev/fd0				# Floppy 0 under CygWin
+  /dev/sdc				# physical HDs No. 2 (=c) under CygWin
+  /dev/sdc1				# Same, partition 1
+
+Other programs may be used too:
+
+  D:\mkbt20>mkbt -x -c e: c:\bootstrap-e2
+  * Expert mode (-x)
+  * Copy bootsector mode (-c)
+
+  dd if=//./e: of=c:/bootstrap-e-dd count=16
+  dd --list
+
+CygWin's C<dd> may be flacky; you may want to try
+L<http://www.chrysocome.net/dd>.  You may need I<"elevated privilige">
+under Vista.
 
 =head1 BUGS
 
