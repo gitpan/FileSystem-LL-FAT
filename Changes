@@ -33,3 +33,6 @@ Revision history for Perl extension FileSystem::LL::FAT.
 	Argument $how to recurse_dir() etc changed to a hash reference.
 	Now actually used for system recovery...
 
+0.05
+	File time logic (without local --> global conversion).
+	Preallocate variable-to-sysread-to.

@@ -47,6 +47,7 @@ eval {
 usage: $0 [-nFAT=N -offset=BYTES -extract-rootdir=ROOTDIR -rootdir
 	   -dump-bs -notry-MBR -read-bs=FILE -read-FAT=FILE -read-rootdir=FILE
 	   -extra-offset=N -ignore-FAT -partition=PART_NUM
+	   -output-bs=FILE
 	   -output-FAT=FILE -compress-FAT -assume-FAT-flavor=12|16|32
 	   -emit-cl-chain=START,LEN[cl] ]       [ < \\.\f: ]
 

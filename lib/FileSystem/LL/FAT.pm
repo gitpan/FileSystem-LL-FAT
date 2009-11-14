@@ -27,7 +27,7 @@ require Exporter;
 	
 );
 
-$VERSION = '0.04';
+$VERSION = '0.05';
 use strict;
 
 my $lim_read = $ENV{FAT_READ_NEEDS_1SECTOR};
@@ -575,7 +575,7 @@ sub min($$){my($a,$b)=@_;$a>$b? $b:$a}
 sub seek_and_read ($$$$;$) {
   my ($fh, $seek, $read) = (shift,shift,shift);
   sysseek $fh, $seek, 0 or die "sysseek $seek: $!" if defined $seek;
-  $_[0] = '' unless defined $_[0];
+  $_[0]=' ', $_[0] x= $read, $_[0] = '' unless defined $_[0];
   die "seek_and_read outside of string" if ($_[1] || 0) > length $_[0];
   substr($_[0], $_[1] || 0) = '';
   my($r,$t,$c) = ($read, 0);
